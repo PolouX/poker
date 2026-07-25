@@ -1,0 +1,7 @@
+Quiero que hagas los siguietnes cambios en la ui, primeor que nada vamos a usar un header, la idea es del lado izquierdo tener un dropdown para sleeccionar el grupo que se ve la infomraciony del lado dderecho el boton de crear grupo un primary button aqui. Tambien aqui vamos a meter un btoon para cambiar entre dark y light mode siempre el default debe de ser light mode.
+
+Luego para la seccion de temporada vamos a eliminar el badge de activa y vamos a centrar el titulo y bajar un poco el weight para la tabla cambia la letra J por A de asistencias. y asegurate que las 2 columnas de handicap y a esten bien dsitribuidas por que se pegan mucho a la derecha ahorita, despues para lo de jugadas usaremos una tabla igual que la de arriba pero con dos columnas el nombre de la jugada y en la otra el ganador de la jugada. 
+
+Despues para admin, el titulo dejalo igual al nuevo de la seccion de temporada osea mismo estiloy para la de admin elimina la descripcion y para el pin vamos a usar el componente de INputOTP y ni si quiera vamos a tener boton de entrar solamente cuando se ingrese te carga la seccion, sin picarle a entrar despue en el panel de admin vamos a dejar el titulo igual a los otros pero que diga Adminsitrador para que sea consistente despues el boton de finalizar lo dejamos ahi pero el otro lo ponemos abajo para que sea mas facil de dar click tambien apra finalizar una temporada debe de pedir confirmacion.
+
+De momento solo esos cambios y asegurate que todos los tiutlos de todas las paginas sean constentes con ele stilo del titulo de temporada
