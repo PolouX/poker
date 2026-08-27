@@ -1,65 +1,157 @@
-import Image from "next/image";
+'use client'
 
-export default function Home() {
+import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { Button, Card, Input, Label, Modal, Spinner } from '@heroui/react'
+
+import { getGroups, createGroup } from './actions/groups'
+import PinInput from './components/PinInput'
+
+type Group = { id: string; name: string; created_at: string }
+
+export default function HomePage() {
+  const router = useRouter()
+  const [groups, setGroups] = useState<Group[]>([])
+  const [loading, setLoading] = useState(true)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [groupName, setGroupName] = useState('')
+  const [pin, setPin] = useState('')
+  const [pinConfirm, setPinConfirm] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState('')
+  const [search, setSearch] = useState('')
+
+  useEffect(() => {
+    getGroups().then(setGroups).finally(() => setLoading(false))
+    document.documentElement.classList.add('dark')
+  }, [])
+
+  function openModal() {
+    setGroupName('')
+    setPin('')
+    setPinConfirm('')
+    setError('')
+    setModalOpen(true)
+  }
+
+  async function handleCreate() {
+    if (!groupName.trim()) return setError('Ingresa un nombre para el grupo.')
+    if (!/^\d{4,6}$/.test(pin)) return setError('El PIN debe ser de 4 a 6 digitos numericos.')
+    if (pin !== pinConfirm) return setError('Los PINs no coinciden.')
+    setCreating(true)
+    setError('')
+    try {
+      const data = await createGroup(groupName.trim(), pin)
+      setModalOpen(false)
+      router.push(`/${data.id}`)
+    } catch {
+      setError('Error al crear el grupo. Intenta de nuevo.')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const filteredGroups = groups.filter((g) =>
+    g.name.toLowerCase().includes(search.toLowerCase())
+  )
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="flex flex-col min-h-screen">
+      {loading ? (
+        <div className="flex justify-center mt-12">
+          <Spinner />
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
-  );
+      ) : (
+        <>
+          {/* Barra de búsqueda */}
+          {groups.length > 0 && (
+            <div className="px-3 pt-4">
+              <Input
+                placeholder="Buscar grupo..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full"
+              />
+            </div>
+          )}
+
+          {/* Lista de grupos */}
+          <div className="flex flex-col gap-2 px-3 pt-3 flex-1">
+            {filteredGroups.length === 0 && groups.length === 0 && (
+              <Card variant="transparent" className="text-center py-10">
+                <Card.Content>
+                  <p className="text-sm text-muted">No hay grupos aun. Crea el primero.</p>
+                </Card.Content>
+              </Card>
+            )}
+            {filteredGroups.length === 0 && groups.length > 0 && (
+              <Card variant="transparent" className="text-center py-10">
+                <Card.Content>
+                  <p className="text-sm text-muted">No se encontraron grupos.</p>
+                </Card.Content>
+              </Card>
+            )}
+            {filteredGroups.map((g) => (
+              <Card
+                key={g.id}
+                className="cursor-pointer active:opacity-70 transition-opacity"
+                onClick={() => router.push(`/${g.id}`)}
+              >
+                <Card.Content className="py-3 flex items-center justify-center">
+                  <p className="font-semibold text-base text-center">{g.name}</p>
+                </Card.Content>
+              </Card>
+            ))}
+          </div>
+
+          {/* Botón crear nuevo grupo */}
+          <div className="px-3 py-6">
+            <Button className="w-full" onPress={openModal}>
+              Crear nuevo grupo
+            </Button>
+          </div>
+        </>
+      )}
+
+      <Modal.Backdrop isOpen={modalOpen} onOpenChange={setModalOpen} variant="blur">
+        <Modal.Container>
+          <Modal.Dialog>
+            <Modal.CloseTrigger />
+            <Modal.Header>
+              <Modal.Heading>Nuevo grupo</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="flex flex-col gap-4">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="group-name">Nombre del grupo</Label>
+                <Input
+                  id="group-name"
+                  placeholder="Ej. Los Carnales"
+                  value={groupName}
+                  onChange={(e) => setGroupName(e.target.value)}
+                  variant="secondary"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="group-pin">PIN (4 a 6 digitos)</Label>
+                <PinInput id="group-pin" value={pin} onChange={setPin} variant="secondary" />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="group-pin-confirm">Confirmar PIN</Label>
+                <PinInput id="group-pin-confirm" value={pinConfirm} onChange={setPinConfirm} variant="secondary" />
+              </div>
+              {error && <p className="text-sm text-danger">{error}</p>}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button variant="ghost" onPress={() => setModalOpen(false)} isDisabled={creating}>
+                Cancelar
+              </Button>
+              <Button onPress={handleCreate} isPending={creating} isDisabled={creating}>
+                Crear grupo
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </main>
+  )
 }

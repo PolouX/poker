@@ -1,0 +1,922 @@
+'use client'
+
+import { useEffect, useState, use, useCallback, useRef } from 'react'
+import { useRouter } from 'next/navigation'
+import { Button, Card, Checkbox, Drawer, Label, ListBox, Modal, Select, Separator, Spinner, Table, Tabs } from '@heroui/react'
+import { CircleXmark, CirclePlus, CircleDollar } from '@gravity-ui/icons'
+import { supabase } from '@/lib/supabase'
+import { advanceBlindLevel, registerElimination, registerRebuy, registerAddon, finishGame, getGameState, registerFinalPosition } from '@/app/actions/games'
+
+interface Props {
+  params: Promise<{ group_id: string; game_id: string }>
+}
+
+interface Attendee {
+  id: string
+  name: string
+  is_guest: boolean
+  guest_name?: string
+}
+
+interface GameConfig {
+  points_per_kill?: number
+  points_per_attendance?: number
+  points_per_rebuy?: number
+  points_per_addon?: number
+  max_rebuys_per_player?: number
+  rebuy_close_level?: number
+  blind_levels?: Array<{ small: number; big: number; duration: number; ante?: number }>
+  ante_start_level?: number
+  ante_amount?: number
+  entry_amount?: number
+  rebuy_amount?: number
+  addon_amount?: number
+  kill_amount?: number
+  reserve_per_game?: number
+  points_position_scale?: number[]
+  points_position_increment?: number
+  points_count_guests?: boolean
+  addon_enabled?: boolean
+  addon_level?: number
+  prize_entries?: Array<{ position: number; type: 'percentage' | 'fixed'; value: number }>
+}
+
+interface GameEvent {
+  id: string
+  type: string
+  player_id: string | null
+  eliminated_by_player_id: string | null
+  guest_name: string | null
+  eliminated_by_guest_name: string | null
+  position: number | null
+  created_at: string
+}
+
+// ── Narrador ─────────────────────────────────────────────────────────────────
+const ELIM_DIALOGUES = [
+  (victim: string, killer: string) => `${victim} mordio el polvo. ${killer} apretó el gatillo sin piedad.`,
+  (victim: string, killer: string) => `${killer} mando a ${victim} a la banca. Ni modo.`,
+  (victim: string, killer: string) => `${victim} se va con las manos vacias. ${killer} cobro la deuda.`,
+  (victim: string, killer: string) => `Se acabo la racha de ${victim}. ${killer} no tuvo clemencia.`,
+  (victim: string, killer: string) => `${victim} out. ${killer} sigue limpiando la mesa.`,
+  (victim: string, killer: string) => `${killer} sirvio la eliminacion de ${victim} fria y calculada.`,
+  (victim: string, killer: string) => `${victim} se fue al lobby. ${killer} dice que ni lo sintio.`,
+  (victim: string, killer: string) => `${victim} ya puede ir por una cerveza. ${killer} sigue en pie.`,
+  (victim: string, killer: string) => `${killer} no mostro compasion. ${victim} empaca y se va.`,
+  (victim: string, killer: string) => `Mano limpia de ${killer}. ${victim} no supo que lo golpeo.`,
+  (victim: string, killer: string) => `${victim} tenia sus fichas contadas. ${killer} se las conto el.`,
+  (victim: string, killer: string) => `${killer} cerro la mesa para ${victim}. Game over.`,
+]
+const POSITION_DIALOGUES: Record<number, (name: string) => string> = {
+  1: (n) => `${n} gana la noche. El rey de la mesa.`,
+  2: (n) => `${n} queda subcampeon. Tan cerca y tan lejos.`,
+  3: (n) => `${n} se lleva el tercer lugar. Podio asegurado.`,
+}
+const DEFAULT_POSITION = (n: string, pos: number) => `${n} termino en el lugar #${pos}.`
+
+function narrateEvent(
+  type: string,
+  playerName: string | undefined,
+  killerName: string | undefined,
+  position: number | null,
+): string {
+  if (type === 'position') {
+    const pos = position ?? 0
+    const fn = POSITION_DIALOGUES[pos]
+    return fn ? fn(playerName ?? '?') : DEFAULT_POSITION(playerName ?? '?', pos)
+  }
+  if (type === 'elimination') {
+    const fn = ELIM_DIALOGUES[Math.floor(Math.random() * ELIM_DIALOGUES.length)]
+    return fn(playerName ?? '?', killerName ?? '?')
+  }
+  return ''
+}
+
+function calcPot(cfg: GameConfig, attendees: Attendee[], evts: GameEvent[]): number {
+  const entryAmount = cfg.entry_amount ?? 0
+  const rebuyAmount = cfg.rebuy_amount ?? 0
+  const addonAmount = cfg.addon_amount ?? 0
+  const killAmount = cfg.kill_amount ?? 0
+  const reservePerGame = cfg.reserve_per_game ?? 0
+  const totalEntry = attendees.length * entryAmount
+  const totalRebuys = evts.filter((e) => e.type === 'rebuy').length * rebuyAmount
+  const totalAddons = evts.filter((e) => e.type === 'addon').length * addonAmount
+  // Todas las kills se pagan, no solo las permanentes
+  const totalKills = evts.filter((e) => e.type === 'elimination').length
+  const totalKillsPaid = totalKills * killAmount
+  return Math.max(0, totalEntry + totalRebuys + totalAddons - totalKillsPaid - reservePerGame)
+}
+
+function calcPrizeForPosition(position: number, pot: number, prizeEntries: Array<{ position: number; type: 'percentage' | 'fixed'; value: number }>): number {
+  const entry = prizeEntries.find((p) => p.position === position)
+  if (!entry) return 0
+  if (entry.type === 'fixed') return entry.value
+  // Para porcentajes: restar todos los premios fijos del bote primero
+  const totalFixed = prizeEntries
+    .filter((p) => p.type === 'fixed')
+    .reduce((s, p) => s + p.value, 0)
+  const distributablePot = Math.max(0, pot - totalFixed)
+  return Math.round(distributablePot * entry.value / 100)
+}
+
+function calcPositionPoints(position: number, totalPlayers: number, scale: number[], increment = 1): number {
+  if (scale && scale.length > 0) {
+    const idx = position - 1
+    if (idx < scale.length) return scale[idx]
+    return 0
+  }
+  const pts = Math.max(0, (totalPlayers - (position - 1)) * increment)
+  return pts
+}
+
+export default function GamePage({ params }: Props) {
+  const { group_id, game_id } = use(params)
+  const router = useRouter()
+  const [loading, setLoading] = useState(true)
+  const [gameName, setGameName] = useState('')
+  const [gameStatus, setGameStatus] = useState('active')
+  const [blindLevel, setBlindLevel] = useState(0)
+  const [config, setConfig] = useState<GameConfig>({})
+  const [attendees, setAttendees] = useState<Attendee[]>([])
+  const [events, setEvents] = useState<GameEvent[]>([])
+  const [activePlayers, setActivePlayers] = useState<Attendee[]>([])
+  const [showRebuyModal, setShowRebuyModal] = useState(false)
+  const [headerHeight, setHeaderHeight] = useState(260)
+  const [gameStartedAt, setGameStartedAt] = useState<string | null>(null)
+  const [elapsed, setElapsed] = useState('00:00')
+  const headerRef = useRef<HTMLDivElement>(null)
+  const narrateCache = useRef<Record<string, string>>({})
+  const [selectedElim, setSelectedElim] = useState<Attendee | null>(null)
+  const [selectedKiller, setSelectedKiller] = useState<Attendee | null>(null)
+  const [doRebuy, setDoRebuy] = useState(false)
+  const [selectedRebuyPlayer, setSelectedRebuyPlayer] = useState<Attendee | null>(null)
+  const [rebuyTab, setRebuyTab] = useState<'rebuy' | 'addon'>('rebuy')
+  const [paymentQueue, setPaymentQueue] = useState<Array<{ name: string; kills: number; amount: number; prizeAmount?: number }>>([])
+  const [pendingFinish, setPendingFinish] = useState<{ winner: Attendee; allAtt: Attendee[]; allEvts: GameEvent[] } | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [finished, setFinished] = useState(false)
+  const [finalResults, setFinalResults] = useState<Array<{ name: string; position: number; total_points: number }>>([])
+
+  const computeActive = useCallback((allAttendees: Attendee[], allEvents: GameEvent[]) => {
+    const rebuyEvts = allEvents.filter((e) => e.type === 'rebuy')
+    const elimEvts = allEvents.filter((e) => e.type === 'elimination')
+    const active: Attendee[] = []
+    for (const att of allAttendees) {
+      const matchFn = (e: GameEvent) =>
+        att.is_guest ? e.guest_name === att.guest_name : e.player_id === att.id
+      const myElims = elimEvts.filter(matchFn)
+      if (myElims.length === 0) { active.push(att); continue }
+      const myRebuys = rebuyEvts.filter(matchFn)
+      if (myRebuys.length >= myElims.length) active.push(att)
+    }
+    return active
+  }, [])
+
+  const load = useCallback(async () => {
+    const { events: evts, attendees: atts, game } = await getGameState(game_id)
+    if (!game) { setLoading(false); return }
+
+    setGameName(game.name)
+    setGameStatus(game.status)
+    setBlindLevel(game.current_blind_level)
+    if ((game as unknown as { created_at?: string }).created_at) {
+      setGameStartedAt((game as unknown as { created_at: string }).created_at)
+    }
+
+    const { data: season } = await supabase
+      .from('seasons')
+      .select('config')
+      .eq('id', game.season_id)
+      .single()
+
+    const cfg: GameConfig = (season?.config as GameConfig) ?? {}
+    setConfig(cfg)
+
+    const allAttendees: Attendee[] = atts.map((a) => ({
+      id: a.player_id ?? a.guest_name ?? '',
+      name: a.is_guest ? (a.guest_name ?? 'Invitado') : '',
+      is_guest: a.is_guest,
+      guest_name: a.guest_name ?? undefined,
+    }))
+
+    const playerIds = atts.filter((a) => !a.is_guest && a.player_id).map((a) => a.player_id!)
+    if (playerIds.length > 0) {
+      const { data: playerNames } = await supabase
+        .from('players')
+        .select('id, name')
+        .in('id', playerIds)
+      for (const att of allAttendees) {
+        if (!att.is_guest) {
+          const p = playerNames?.find((p) => p.id === att.id)
+          if (p) att.name = p.name
+        }
+      }
+    }
+
+    setAttendees(allAttendees)
+    setEvents(evts as GameEvent[])
+    setActivePlayers(computeActive(allAttendees, evts as GameEvent[]))
+    setLoading(false)
+  }, [game_id, computeActive])
+
+  useEffect(() => { load() }, [load])
+
+  // Cuando se vacía la cola de pagos y hay un finish pendiente, ejecutarlo
+  useEffect(() => {
+    if (!pendingFinish || paymentQueue.length > 0) return
+    const { winner, allAtt, allEvts } = pendingFinish
+    setPendingFinish(null)
+    handleFinishGame(winner, allAtt, allEvts)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingFinish, paymentQueue])
+
+  useEffect(() => {
+    if (!headerRef.current) return
+    const obs = new ResizeObserver(() => {
+      if (headerRef.current) setHeaderHeight(headerRef.current.offsetHeight)
+    })
+    obs.observe(headerRef.current)
+    return () => obs.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!gameStartedAt || finished) return
+    const tick = () => {
+      const diff = Math.floor((Date.now() - new Date(gameStartedAt).getTime()) / 1000)
+      const h = Math.floor(diff / 3600)
+      const m = Math.floor((diff % 3600) / 60)
+      const s = diff % 60
+      const pad = (n: number) => String(n).padStart(2, '0')
+      setElapsed(h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`)
+    }
+    tick()
+    const interval = setInterval(tick, 1000)
+    return () => clearInterval(interval)
+  }, [gameStartedAt, finished])
+
+  const currentBlind = config.blind_levels?.[blindLevel]
+  const maxRebuys = config.max_rebuys_per_player ?? 2
+  const rebuyCloseLevel = config.rebuy_close_level ?? 3
+  const canRebuyByLevel = blindLevel < rebuyCloseLevel
+
+  const addonEnabled = config.addon_enabled ?? false
+  const addonLevel = config.addon_level ?? 999
+  const canAddonByLevel = addonEnabled && blindLevel === addonLevel - 1
+
+  function getPlayerRebuys(att: Attendee) {
+    return events.filter((e) =>
+      (e.type === 'rebuy' || e.type === 'addon') &&
+      (att.is_guest ? e.guest_name === att.guest_name : e.player_id === att.id)
+    ).length
+  }
+
+  function canPlayerRebuy(att: Attendee) {
+    return canRebuyByLevel && getPlayerRebuys(att) < maxRebuys
+  }
+
+  function canPlayerAddon(att: Attendee) {
+    return canAddonByLevel && getPlayerRebuys(att) < maxRebuys
+  }
+
+  async function handleEliminate() {
+    if (!selectedElim) return
+    setSaving(true)
+
+    const position = activePlayers.length
+    const pid = selectedElim.is_guest ? null : selectedElim.id
+    const killerPid = selectedKiller?.is_guest ? null : (selectedKiller?.id ?? null)
+    const didRebuy = doRebuy
+    const elimGuestName = selectedElim.is_guest ? selectedElim.name : null
+    const killerGuestName = selectedKiller?.is_guest ? selectedKiller.name : null
+
+    await registerElimination(game_id, pid, killerPid, position, didRebuy, elimGuestName, killerGuestName)
+
+    // Calcular remaining localmente
+    const remaining = didRebuy
+      ? activePlayers
+      : activePlayers.filter((p) => p.id !== selectedElim.id)
+
+    setSelectedElim(null)
+    setSelectedKiller(null)
+    setDoRebuy(false)
+
+    // Actualizar eventos desde BD
+    const { events: newEvts } = await getGameState(game_id)
+    setEvents(newEvts as GameEvent[])
+
+    // Si la eliminación es permanente, calcular pago de kills + premio de posición
+    if (!didRebuy) {
+      const killAmount = config.kill_amount ?? 0
+      const evts = newEvts as GameEvent[]
+
+      const myKills = killAmount > 0
+        ? evts.filter((e) => e.type === 'elimination' && (
+            selectedElim.is_guest
+              ? e.eliminated_by_guest_name === selectedElim.name
+              : e.eliminated_by_player_id === selectedElim.id
+          )).length
+        : 0
+      const killsAmt = myKills * killAmount
+
+      // Premio por posición del jugador eliminado
+      const prizeEntries = config.prize_entries ?? []
+      const pot = calcPot(config, attendees, evts)
+      const prize = calcPrizeForPosition(position, pot, prizeEntries)
+
+      if (killsAmt > 0 || prize > 0) {
+        setPaymentQueue((q) => [...q, {
+          name: selectedElim.name,
+          kills: myKills,
+          amount: killsAmt,
+          prizeAmount: prize > 0 ? prize : undefined,
+        }])
+      }
+    }
+
+    if (remaining.length <= 1) {
+      const winner = remaining[0] ?? activePlayers.find((p) => p.id !== selectedElim.id) ?? activePlayers[0]
+      const evts = newEvts as GameEvent[]
+      const elimEvts = evts.filter((e) => e.type === 'elimination')
+
+      // Pago del ganador (posición 1): kills + premio
+      {
+        const killAmt = config.kill_amount ?? 0
+        const winnerKills = killAmt > 0
+          ? elimEvts.filter((e) => winner.is_guest
+              ? e.eliminated_by_guest_name === winner.name
+              : e.eliminated_by_player_id === winner.id
+            ).length
+          : 0
+        const winnerKillsAmt = winnerKills * killAmt
+
+        const prizeEntries = config.prize_entries ?? []
+        const pot = calcPot(config, attendees, evts)
+        const winnerPrize = calcPrizeForPosition(1, pot, prizeEntries)
+
+        if (winnerKillsAmt > 0 || winnerPrize > 0) {
+          setPaymentQueue((q) => [...q, {
+            name: winner.name,
+            kills: winnerKills,
+            amount: winnerKillsAmt,
+            prizeAmount: winnerPrize > 0 ? winnerPrize : undefined,
+          }])
+        }
+      }
+
+      setPendingFinish({ winner, allAtt: attendees, allEvts: evts })
+    } else {
+      setActivePlayers(remaining)
+    }
+
+    setSaving(false)
+  }
+
+  async function handleFinishGame(winner: Attendee, allAtt: Attendee[], allEvts: GameEvent[]) {
+    const elimEvts = allEvts.filter((e) => e.type === 'elimination')
+    const rebuyEvts = allEvts.filter((e) => e.type === 'rebuy')
+    const cfg = config
+
+    const positionMap: Record<string, number> = {}
+    const processedElims: string[] = []
+
+    for (const e of elimEvts) {
+      // Usar el mismo identificador unificado que att.id: UUID para oficiales, guest_name para guests
+      const key = e.player_id ?? e.guest_name ?? ''
+      const rebuysDespues = rebuyEvts.filter((r) => {
+        const rKey = r.player_id ?? r.guest_name ?? ''
+        return rKey === key && r.created_at > e.created_at
+      }).length
+      const elimAnteriores = processedElims.filter((p) => p === key).length
+      if (rebuysDespues <= elimAnteriores) {
+        positionMap[key] = e.position ?? 0
+      }
+      processedElims.push(key)
+    }
+    positionMap[winner.id] = 1
+
+    const countGuests = cfg.points_count_guests ?? false
+    const totalPlayers = countGuests ? allAtt.length : allAtt.filter((a) => !a.is_guest).length
+    const scale = cfg.points_position_scale ?? []
+    const increment = cfg.points_position_increment ?? 1
+    const pkill = cfg.points_per_kill ?? 1
+    const patt = cfg.points_per_attendance ?? 1
+    const prebuy = cfg.points_per_rebuy ?? -1
+
+    // Usar att.id como clave unificada (para guests es guest_name, para oficiales es UUID)
+    const killsMap: Record<string, number> = {}
+    for (const e of elimEvts) {
+      const key = e.eliminated_by_player_id ?? e.eliminated_by_guest_name ?? ''
+      if (key) killsMap[key] = (killsMap[key] ?? 0) + 1
+    }
+
+    const rebuysMap: Record<string, number> = {}
+    for (const e of rebuyEvts) {
+      const key = e.player_id ?? e.guest_name ?? ''
+      if (key) rebuysMap[key] = (rebuysMap[key] ?? 0) + 1
+    }
+
+    // Calcular premios por posición
+    const prizeEntries = cfg.prize_entries ?? []
+    const pot = calcPot(cfg, allAtt, allEvts)
+
+    const results = allAtt.map((att) => {
+      const pid = att.is_guest ? null : att.id
+      const pos = positionMap[att.id] ?? totalPlayers
+      const kills = killsMap[att.id] ?? 0
+      const rebuys = rebuysMap[att.id] ?? 0
+      const ptPos = calcPositionPoints(pos, totalPlayers, scale, increment)
+      const ptKills = kills * pkill
+      const ptAtt = (!att.is_guest || countGuests) ? patt : 0
+      const ptRebuy = rebuys * prebuy
+      const total = ptPos + ptKills + ptAtt + ptRebuy
+
+      const prize = calcPrizeForPosition(pos, pot, prizeEntries)
+
+      return {
+        player_id: pid,
+        is_guest: att.is_guest,
+        guest_name: att.is_guest ? att.name : null,
+        position: pos,
+        points_position: ptPos,
+        points_kills: ptKills,
+        points_attendance: ptAtt,
+        points_rebuy: ptRebuy,
+        points_addon: 0,
+        total_points: total,
+        kills_count: kills,
+        rebuys_count: rebuys,
+        prize_amount: prize,
+      }
+    })
+
+    // Registrar posición #1 del ganador para el narrador
+    const winnerPid = winner.is_guest ? null : winner.id
+    await registerFinalPosition(game_id, winnerPid, 1)
+
+    await finishGame(game_id, '', results)
+    setGameStatus('finished')
+    setFinished(true)
+    setFinalResults(
+      results
+        .sort((a, b) => b.total_points - a.total_points)
+        .map((r) => ({
+          name: r.is_guest ? (r.guest_name ?? 'Invitado') : (allAtt.find((a) => a.id === (r.player_id ?? ''))?.name ?? ''),
+          position: r.position,
+          total_points: r.total_points,
+        }))
+    )
+  }
+
+  async function handleVoluntaryRebuy() {
+    if (!selectedRebuyPlayer) return
+    setSaving(true)
+    const pid = selectedRebuyPlayer.is_guest ? null : selectedRebuyPlayer.id
+    if (rebuyTab === 'addon') {
+      await registerAddon(game_id, pid)
+    } else {
+      await registerRebuy(game_id, pid, selectedRebuyPlayer.is_guest, selectedRebuyPlayer.guest_name)
+    }
+    setShowRebuyModal(false)
+    setSelectedRebuyPlayer(null)
+    await load()
+    setSaving(false)
+  }
+
+  if (loading) return <div className="flex justify-center mt-16"><Spinner /></div>
+
+  if (finished) {
+    return (
+      <div className="p-4 max-w-md mx-auto">
+        <div className="mt-4 mb-4 text-center">
+          <h1 className="text-2xl font-semibold tracking-tight">Jugada finalizada</h1>
+          <p className="text-sm text-muted mt-1">{gameName}</p>
+        </div>
+
+        <Card className="mb-6 overflow-hidden p-0">
+          <Table>
+            <Table.ScrollContainer>
+              <Table.Content aria-label="Resultados finales">
+                <Table.Header>
+                  <Table.Column isRowHeader className="w-8">#</Table.Column>
+                  <Table.Column>Jugador</Table.Column>
+                  <Table.Column className="text-right">Pts</Table.Column>
+                </Table.Header>
+                <Table.Body>
+                  {finalResults.map((r) => (
+                    <Table.Row key={r.position}>
+                      <Table.Cell className="text-muted font-mono text-sm">{r.position}</Table.Cell>
+                      <Table.Cell className="font-medium">{r.name}</Table.Cell>
+                      <Table.Cell className="text-right font-semibold">{r.total_points}</Table.Cell>
+                    </Table.Row>
+                  ))}
+                </Table.Body>
+              </Table.Content>
+            </Table.ScrollContainer>
+          </Table>
+        </Card>
+
+        <Button onPress={() => router.push(`/${group_id}/admin`)} className="w-full" size="lg">
+          Volver al panel
+        </Button>
+      </div>
+    )
+  }
+
+  const blindLevels = config.blind_levels ?? []
+  const prevBlind = blindLevel > 0 ? blindLevels[blindLevel - 1] : null
+  const nextBlind = blindLevel + 1 < blindLevels.length ? blindLevels[blindLevel + 1] : null
+
+  return (
+    <>
+    {/* Layout fijo: header + carrusel + recompra */}
+    <div ref={headerRef} className="fixed top-[44px] left-0 right-0 z-30 bg-background">
+      <div className="px-4 pt-3 pb-2 max-w-md mx-auto">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-mono text-muted w-16">{elapsed}</span>
+          <h1 className="text-xl font-semibold tracking-tight">{gameName}</h1>
+          <div className="w-16 flex justify-end">
+            <button
+              onClick={() => setShowRebuyModal(true)}
+              className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] active:opacity-60 transition-opacity"
+              aria-label="Recompra"
+            >
+              <CircleDollar width={18} />
+            </button>
+          </div>
+        </div>
+
+      {/* Carrusel de niveles de ciegas */}
+      {(() => {
+        // Construir secuencia virtual de slots: niveles de ciegas + slot "Sin recompras" + slot "Add-on"
+        // Cada slot: { type: 'blind' | 'no_rebuy' | 'addon', index: number (para blinds) }
+        type Slot =
+          | { type: 'blind'; idx: number }
+          | { type: 'no_rebuy' }
+          | { type: 'addon' }
+
+        const slots: Slot[] = []
+        const levels = config.blind_levels ?? []
+        const addonLevel = config.addon_level ?? 999
+        const addonEnabled = config.addon_enabled ?? false
+
+        for (let i = 0; i < levels.length; i++) {
+          slots.push({ type: 'blind', idx: i })
+          // Insertar "Sin recompras" justo después del último nivel con recompras
+          if (i === rebuyCloseLevel - 1 && rebuyCloseLevel < levels.length) {
+            slots.push({ type: 'no_rebuy' })
+          }
+          // Insertar "Add-on" después del nivel configurado
+          if (addonEnabled && i === addonLevel - 1) {
+            slots.push({ type: 'addon' })
+          }
+        }
+
+        // Posición actual en la secuencia virtual
+        const currentSlotIdx = slots.findIndex(
+          (s) => s.type === 'blind' && s.idx === blindLevel
+        )
+
+        const prevSlot = currentSlotIdx > 0 ? slots[currentSlotIdx - 1] : null
+        const nextSlot = currentSlotIdx < slots.length - 1 ? slots[currentSlotIdx + 1] : null
+
+        // Navegar a un slot: si es blind lo activa, si es especial busca el blind más cercano en esa dirección
+        function navigateToSlot(slotIdx: number, direction: 'prev' | 'next') {
+          const slot = slots[slotIdx]
+          if (slot.type === 'blind') {
+            advanceBlindLevel(game_id, slot.idx)
+            setBlindLevel(slot.idx)
+            return
+          }
+          // Para slots especiales buscar el blind más cercano en la misma dirección de navegación
+          const step = direction === 'prev' ? -1 : 1
+          for (let i = slotIdx + step; i >= 0 && i < slots.length; i += step) {
+            const s = slots[i]
+            if (s.type === 'blind') {
+              advanceBlindLevel(game_id, s.idx)
+              setBlindLevel(s.idx)
+              return
+            }
+          }
+        }
+
+        function renderSideCard(slot: Slot, slotIdx: number, direction: 'prev' | 'next') {
+          if (slot.type === 'blind') {
+            const b = levels[slot.idx]
+            return (
+              <Card
+                variant="secondary"
+                className="opacity-50 cursor-pointer active:opacity-30 transition-opacity"
+                onClick={() => navigateToSlot(slotIdx, direction)}
+              >
+                <Card.Content className="py-3 flex flex-col items-center gap-0.5">
+                  <p className="text-xs text-muted">Nivel {slot.idx + 1}</p>
+                  <p className="text-lg font-bold">{b.small}/{b.big}</p>
+                  {slot.idx >= (config.ante_start_level ?? 999) && (
+                    <p className="text-xs text-muted">A:{config.ante_amount ?? 0}</p>
+                  )}
+                </Card.Content>
+              </Card>
+            )
+          }
+          if (slot.type === 'no_rebuy') {
+            return (
+              <Card
+                variant="secondary"
+                className="opacity-50 cursor-pointer active:opacity-30 transition-opacity"
+                onClick={() => navigateToSlot(slotIdx, direction)}
+              >
+                <Card.Content className="py-3 flex flex-col items-center gap-0.5">
+                  <CircleXmark className="text-danger" width={16} />
+                  <p className="text-xs font-medium text-muted text-center leading-tight mt-0.5">Sin<br/>recompras</p>
+                </Card.Content>
+              </Card>
+            )
+          }
+          if (slot.type === 'addon') {
+            return (
+              <Card
+                variant="secondary"
+                className="opacity-50 cursor-pointer active:opacity-30 transition-opacity"
+                onClick={() => navigateToSlot(slotIdx, direction)}
+              >
+                <Card.Content className="py-3 flex flex-col items-center gap-0.5">
+                  <CirclePlus className="text-success" width={16} />
+                  <p className="text-xs font-medium text-muted text-center leading-tight mt-0.5">Add-on</p>
+                </Card.Content>
+              </Card>
+            )
+          }
+          return null
+        }
+
+        return (
+          <div className="flex items-center gap-2 mb-2">
+            {/* Anterior */}
+            <div className="flex-1">
+              {prevSlot ? renderSideCard(prevSlot, currentSlotIdx - 1, 'prev') : <div />}
+            </div>
+
+            {/* Actual */}
+            <div className="flex-[1.6]">
+              <Card className="bg-[var(--accent)] border-0 shadow-none">
+                <Card.Content className="py-5 flex flex-col items-center gap-1">
+                  <p className="text-xs font-medium text-white/70">Nivel {blindLevel + 1}</p>
+                  {currentBlind ? (
+                    <>
+                      <p className="text-3xl font-bold text-white tracking-tight">
+                        {currentBlind.small}/{currentBlind.big}
+                      </p>
+                      {blindLevel >= (config.ante_start_level ?? 999) && (
+                        <p className="text-sm text-white/70">Ante: {config.ante_amount ?? 0}</p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-white/70">Sin niveles</p>
+                  )}
+                </Card.Content>
+              </Card>
+            </div>
+
+            {/* Siguiente */}
+            <div className="flex-1">
+              {nextSlot ? renderSideCard(nextSlot, currentSlotIdx + 1, 'next') : <div />}
+            </div>
+          </div>
+        )
+      })()}
+
+      </div>{/* fin zona fija */}
+    </div>{/* fin fixed */}
+
+    {/* Zona scrolleable: solo el narrador */}
+    <div className="max-w-md mx-auto px-4 pb-[130px]" style={{ paddingTop: headerHeight }}>
+      <p className="text-sm font-semibold text-white mb-2 text-center">Actividad</p>
+      <div className="flex flex-col">
+        {(() => {
+          const filtered = events.filter((e) => e.type === 'elimination' || e.type === 'position')
+          if (filtered.length === 0) return (
+            <p className="text-sm text-muted text-center py-8">La partida acaba de comenzar...</p>
+          )
+          return [...filtered].reverse().map((e) => {
+            const playerName = e.guest_name
+              ?? attendees.find((a) => a.id === e.player_id)?.name
+            const killerName = e.eliminated_by_guest_name
+              ?? (e.eliminated_by_player_id ? attendees.find((a) => a.id === e.eliminated_by_player_id)?.name : undefined)
+            if (!narrateCache.current[e.id]) {
+              const text = narrateEvent(e.type, playerName, killerName, e.position)
+              if (text) narrateCache.current[e.id] = text
+            }
+            const text = narrateCache.current[e.id]
+            if (!text) return null
+            return (
+              <div key={e.id} className="flex flex-col gap-2 py-4">
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-muted shrink-0">
+                    {new Date(e.created_at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                  <Separator className="flex-1" />
+                </div>
+                <p className="text-sm leading-relaxed">{text}</p>
+              </div>
+            )
+          })
+        })()}
+      </div>
+    </div>
+
+    {/* Modal: Cola de pagos pendientes */}
+    <Modal.Backdrop isOpen={paymentQueue.length > 0} onOpenChange={() => {}}>
+      <Modal.Container>
+        <Modal.Dialog>
+          <Modal.Header>
+            <Modal.Heading>Pago pendiente</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body>
+            {paymentQueue[0] && (() => {
+              const p = paymentQueue[0]
+              const total = p.amount + (p.prizeAmount ?? 0)
+              return (
+                <div className="flex flex-col gap-3">
+                  <p className="text-sm text-muted">Se debe pagar a:</p>
+                  <p className="text-xl font-semibold">{p.name}</p>
+                  <p className="text-3xl font-bold">${total}</p>
+                  {p.kills > 0 && (
+                    <p className="text-xs text-muted">{p.kills} kill{p.kills > 1 ? 's' : ''} × ${p.amount / p.kills} = <span className="text-foreground">${p.amount}</span></p>
+                  )}
+                  {(p.prizeAmount ?? 0) > 0 && (
+                    <p className="text-xs text-muted">Premio posición: <span className="text-foreground">${p.prizeAmount}</span></p>
+                  )}
+                  {paymentQueue.length > 1 && (
+                    <p className="text-xs text-muted mt-1">+{paymentQueue.length - 1} pago{paymentQueue.length > 2 ? 's' : ''} más pendiente{paymentQueue.length > 2 ? 's' : ''}</p>
+                  )}
+                </div>
+              )
+            })()}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button className="flex-1" onPress={() => setPaymentQueue((q) => q.slice(1))}>
+              Marcar como pagado
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+
+    {/* Drawer: Recompra / Add-on */}
+    <Drawer.Backdrop
+      isOpen={showRebuyModal}
+      onOpenChange={(open) => { setShowRebuyModal(open); if (!open) { setSelectedRebuyPlayer(null); setRebuyTab('rebuy') } }}
+      variant="blur"
+    >
+      <Drawer.Content placement="bottom">
+        <Drawer.Dialog className="max-h-[80vh] flex flex-col">
+          <Drawer.Handle />
+          <Drawer.Header>
+            <Drawer.Heading>Recompra / Add-on</Drawer.Heading>
+          </Drawer.Header>
+          <Drawer.Body className="overflow-y-auto">
+            <Tabs
+              selectedKey={rebuyTab}
+              onSelectionChange={(k) => { setRebuyTab(k as 'rebuy' | 'addon'); setSelectedRebuyPlayer(null) }}
+              className="w-full mb-3"
+            >
+              <Tabs.ListContainer>
+                <Tabs.List aria-label="Tipo">
+                  <Tabs.Tab id="rebuy">Recompra<Tabs.Indicator /></Tabs.Tab>
+                  <Tabs.Tab id="addon" isDisabled={!addonEnabled}>Add-on<Tabs.Indicator /></Tabs.Tab>
+                </Tabs.List>
+              </Tabs.ListContainer>
+            </Tabs>
+            {(() => {
+              const list = rebuyTab === 'rebuy'
+                ? attendees.filter((p) => canPlayerRebuy(p))
+                : attendees.filter((p) => canPlayerAddon(p))
+              if (list.length === 0) return (
+                <p className="text-sm text-muted py-2">
+                  {rebuyTab === 'rebuy' ? 'Ningún jugador puede recomprar ahora.' : 'Ningún jugador puede hacer add-on ahora.'}
+                </p>
+              )
+              return (
+                <div className="grid grid-cols-2 gap-2">
+                  {list.map((p) => (
+                    <Card
+                      key={p.id}
+                      className={`cursor-pointer transition-all bg-[var(--surface-secondary)] ${
+                        selectedRebuyPlayer?.id === p.id ? 'ring-[3px] ring-inset ring-[var(--accent)]' : ''
+                      }`}
+                      onClick={() => setSelectedRebuyPlayer(p)}
+                    >
+                      <Card.Content className="flex flex-col gap-1 py-3 px-3">
+                        <span className="text-sm font-medium leading-tight">{p.name}</span>
+                        <span className="text-xs text-muted">{getPlayerRebuys(p)}/{maxRebuys} usadas</span>
+                      </Card.Content>
+                    </Card>
+                  ))}
+                </div>
+              )
+            })()}
+          </Drawer.Body>
+          <Drawer.Footer>
+            <Button
+              variant="ghost"
+              onPress={() => { setShowRebuyModal(false); setSelectedRebuyPlayer(null); setRebuyTab('rebuy') }}
+            >
+              Cancelar
+            </Button>
+            <Button
+              onPress={handleVoluntaryRebuy}
+              isDisabled={!selectedRebuyPlayer || saving}
+              isPending={saving}
+              className="flex-1"
+            >
+              {rebuyTab === 'rebuy' ? 'Confirmar recompra' : 'Confirmar add-on'}
+            </Button>
+          </Drawer.Footer>
+        </Drawer.Dialog>
+      </Drawer.Content>
+    </Drawer.Backdrop>
+
+    {/* Barra inferior de eliminación */}
+    <div className="fixed bottom-[64px] left-0 right-0 bg-background z-40">
+      <Separator />
+      <div className="flex flex-col gap-2 p-3 max-w-md mx-auto">
+        <div className="flex gap-2">
+          <Select
+            fullWidth
+            placeholder="Sale..."
+            value={selectedElim?.id ?? null}
+            onChange={(key) => {
+              const p = activePlayers.find((p) => p.id === String(key)) ?? null
+              setSelectedElim(p)
+              setSelectedKiller(null)
+              setDoRebuy(false)
+            }}
+          >
+            <Select.Trigger>
+              <Select.Value />
+              <Select.Indicator />
+            </Select.Trigger>
+            <Select.Popover placement="top">
+              <ListBox>
+                {activePlayers.map((p) => (
+                  <ListBox.Item key={p.id} id={p.id} textValue={p.name}>
+                    {p.name}
+                    <ListBox.ItemIndicator />
+                  </ListBox.Item>
+                ))}
+              </ListBox>
+            </Select.Popover>
+          </Select>
+
+          <Select
+            fullWidth
+            placeholder="Killer..."
+            value={selectedKiller?.id ?? null}
+            onChange={(key) => {
+              const p = activePlayers.find((p) => p.id === String(key)) ?? null
+              setSelectedKiller(p)
+            }}
+          >
+            <Select.Trigger>
+              <Select.Value />
+              <Select.Indicator />
+            </Select.Trigger>
+            <Select.Popover placement="top">
+              <ListBox>
+                {activePlayers
+                  .filter((p) => p.id !== selectedElim?.id)
+                  .map((p) => (
+                    <ListBox.Item key={p.id} id={p.id} textValue={p.name}>
+                      {p.name}
+                      <ListBox.ItemIndicator />
+                    </ListBox.Item>
+                  ))}
+              </ListBox>
+            </Select.Popover>
+          </Select>
+        </div>
+
+        {selectedElim && canPlayerRebuy(selectedElim) && (
+          <Label className="flex items-center gap-2 cursor-pointer">
+            <Checkbox isSelected={doRebuy} onChange={(v) => setDoRebuy(v)} aria-label="Recompra">
+              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+            </Checkbox>
+            <span className="text-sm">Se recompra ({getPlayerRebuys(selectedElim)}/{maxRebuys})</span>
+          </Label>
+        )}
+
+        <Button
+          onPress={handleEliminate}
+          isDisabled={!selectedElim || saving}
+          isPending={saving}
+          variant="danger"
+          className="w-full"
+          size="lg"
+        >
+          Confirmar salida
+        </Button>
+      </div>
+    </div>
+    </>
+  )
+}
