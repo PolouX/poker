@@ -122,6 +122,7 @@ export default function AdminPanel({ groupId }: Props) {
   if (view === 'edit_season' && season) {
     return (
       <EditSeasonConfig
+        groupId={groupId}
         season={season}
         onDone={() => { reload(); setView('main') }}
         onCancel={() => setView('main')}

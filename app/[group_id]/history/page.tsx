@@ -239,6 +239,7 @@ import {
   Flame,
 } from '@gravity-ui/icons'
 import { supabase } from '@/lib/supabase'
+import { effectiveDiscard } from '@/lib/scoring'
 
 interface PokerRecord {
   label: string
@@ -420,7 +421,9 @@ function SeasonPlayerProfilePanel({ groupId, playerId, seasonId, totalGames }: {
       ])
       if (!playerData) { setLoading(false); return }
 
-      const discard = (seasonCfg?.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+      const discardCfg = (seasonCfg?.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+      // Solo se descarta cuando hay mas jugadas que descartes
+      const discard = effectiveDiscard(discardCfg, totalGames)
 
       function discardWorst(scores: number[], attended: number): number {
         if (discard <= 0) return scores.reduce((s, v) => s + v, 0)
@@ -893,8 +896,9 @@ export default function HistoryPage({ params }: Props) {
       const seasonPlayerPts: { [key: string]: { name: string; total: number; count: number; season: string } } = {}
       for (const [key, data] of Object.entries(seasonPlayerScores)) {
         const seasonObj = (allSeasons ?? []).find((s) => s.id === data.season)
-        const discard = (seasonObj?.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+        const discardCfg = (seasonObj?.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
         const seasonGameCount = (allGames ?? []).filter((g) => g.season_id === data.season).length
+        const discard = effectiveDiscard(discardCfg, seasonGameCount)
         const attended = data.scores.length
 
         let total: number
@@ -934,8 +938,9 @@ export default function HistoryPage({ params }: Props) {
       for (const season of closedSeasons) {
         const seasonGameIds = (allGames ?? []).filter((g) => g.season_id === season.id).map((g) => g.id)
         if (seasonGameIds.length === 0) continue
-        const discard = (season.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+        const discardCfg = (season.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
         const seasonGameCount = seasonGameIds.length
+        const discard = effectiveDiscard(discardCfg, seasonGameCount)
 
         // Recopilar scores por jugador
         const spScores: { [key: string]: { id: string; name: string; scores: number[] } } = {}
@@ -982,12 +987,14 @@ export default function HistoryPage({ params }: Props) {
     // Obtener config de la temporada para descarte
     const { data: seasonCfg } = await supabase
       .from('seasons').select('config').eq('id', season.id).single()
-    const discard = (seasonCfg?.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+    const discardCfg = (seasonCfg?.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
 
     const { data: gamesData } = await supabase
       .from('games').select('id, name').eq('season_id', season.id).eq('status', 'finished').order('created_at', { ascending: false })
 
     const seasonGameIds = (gamesData ?? []).map((g) => g.id)
+    // Solo se descarta cuando hay mas jugadas que descartes
+    const discard = effectiveDiscard(discardCfg, seasonGameIds.length)
     const totalFinishedGames = seasonGameIds.length
 
     // Ganadores de cada jugada

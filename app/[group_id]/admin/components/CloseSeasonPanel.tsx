@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { Button, Card, Input, Spinner, Table } from '@heroui/react'
 import { supabase } from '@/lib/supabase'
+import { effectiveDiscard } from '@/lib/scoring'
 import { closeSeason } from '@/app/actions/seasons'
 
 interface Props {
@@ -26,7 +27,7 @@ export default function CloseSeasonPanel({ season, onDone, onCancel }: Props) {
 
   useEffect(() => {
     async function load() {
-      const discard = (season.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+      const discardCfg = (season.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
 
       const { data: games } = await supabase
         .from('games')
@@ -37,6 +38,8 @@ export default function CloseSeasonPanel({ season, onDone, onCancel }: Props) {
       const gameIds = (games ?? []).map((g) => g.id)
       const totalFinishedGames = gameIds.length
       if (totalFinishedGames === 0) { setLoading(false); return }
+      // Solo se descarta cuando hay mas jugadas que descartes
+      const discard = effectiveDiscard(discardCfg, totalFinishedGames)
 
       const { data: results } = await supabase
         .from('game_results')

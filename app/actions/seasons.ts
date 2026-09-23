@@ -22,7 +22,8 @@ export interface SeasonConfig {
   prize_entries: Array<{ position: number; type: 'percentage' | 'fixed'; value: number }>
   reserve_per_game: number
   blind_levels: Array<{ small: number; big: number; duration: number; ante?: number }>
-  rebuy_close_level: number
+  /** null = sin cierre: se puede recomprar en cualquier nivel */
+  rebuy_close_level: number | null
   addon_level: number
   ante_start_level: number
   ante_amount: number
@@ -106,4 +107,68 @@ export async function addPlayer(groupId: string, name: string) {
     .single()
   if (error) throw new Error(error.message)
   return data
+}
+
+/**
+ * Actualiza que jugadores participan en la temporada.
+ * No elimina a quienes ya tienen resultados registrados: quitarlos dejaria
+ * jugadas pasadas sin su participante. Devuelve los nombres que no se pudieron
+ * quitar por ese motivo.
+ */
+export async function updateSeasonPlayers(seasonId: string, playerIds: string[]) {
+  const { data: actuales } = await supabase
+    .from('season_players')
+    .select('player_id')
+    .eq('season_id', seasonId)
+
+  const actualesIds = (actuales ?? []).map((r) => r.player_id as string)
+  const aAgregar = playerIds.filter((id) => !actualesIds.includes(id))
+  const aQuitar = actualesIds.filter((id) => !playerIds.includes(id))
+
+  const bloqueados: string[] = []
+  const quitarOk: string[] = []
+
+  if (aQuitar.length > 0) {
+    // Solo cuentan los resultados de ESTA temporada
+    const { data: juegos } = await supabase
+      .from('games')
+      .select('id')
+      .eq('season_id', seasonId)
+    const gameIds = (juegos ?? []).map((g) => g.id as string)
+
+    for (const pid of aQuitar) {
+      if (gameIds.length === 0) { quitarOk.push(pid); continue }
+      const { count } = await supabase
+        .from('game_results')
+        .select('id', { count: 'exact', head: true })
+        .eq('player_id', pid)
+        .in('game_id', gameIds)
+      if ((count ?? 0) > 0) bloqueados.push(pid)
+      else quitarOk.push(pid)
+    }
+  }
+
+  if (aAgregar.length > 0) {
+    const { error } = await supabase
+      .from('season_players')
+      .insert(aAgregar.map((pid) => ({ season_id: seasonId, player_id: pid })))
+    if (error) throw new Error(error.message)
+  }
+
+  if (quitarOk.length > 0) {
+    const { error } = await supabase
+      .from('season_players')
+      .delete()
+      .eq('season_id', seasonId)
+      .in('player_id', quitarOk)
+    if (error) throw new Error(error.message)
+  }
+
+  if (bloqueados.length === 0) return { blockedNames: [] as string[] }
+
+  const { data: nombres } = await supabase
+    .from('players')
+    .select('name')
+    .in('id', bloqueados)
+  return { blockedNames: (nombres ?? []).map((n) => n.name as string) }
 }

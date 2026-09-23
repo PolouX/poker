@@ -2,10 +2,10 @@
 
 import { useEffect, useState, use, useCallback, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { Button, Card, Checkbox, Drawer, Label, ListBox, Modal, Select, Separator, Spinner, Table, Tabs } from '@heroui/react'
-import { CircleXmark, CirclePlus, CircleDollar } from '@gravity-ui/icons'
+import { Button, Card, Checkbox, Drawer, ListBox, Modal, Select, Separator, Spinner, Table } from '@heroui/react'
+import { CircleXmark, CirclePlus, CircleDollar, TrashBin, Pencil, ChartColumn, ArrowUp, ArrowDown } from '@gravity-ui/icons'
 import { supabase } from '@/lib/supabase'
-import { advanceBlindLevel, registerElimination, registerRebuy, registerAddon, finishGame, getGameState, registerFinalPosition } from '@/app/actions/games'
+import { advanceBlindLevel, registerElimination, registerAddon, finishGame, getGameState, registerFinalPosition, addRebuyToElimination, removeRebuyFromElimination, discardGame, reorderEliminations } from '@/app/actions/games'
 
 interface Props {
   params: Promise<{ group_id: string; game_id: string }>
@@ -24,7 +24,7 @@ interface GameConfig {
   points_per_rebuy?: number
   points_per_addon?: number
   max_rebuys_per_player?: number
-  rebuy_close_level?: number
+  rebuy_close_level?: number | null
   blind_levels?: Array<{ small: number; big: number; duration: number; ante?: number }>
   ante_start_level?: number
   ante_amount?: number
@@ -50,46 +50,6 @@ interface GameEvent {
   eliminated_by_guest_name: string | null
   position: number | null
   created_at: string
-}
-
-// ── Narrador ─────────────────────────────────────────────────────────────────
-const ELIM_DIALOGUES = [
-  (victim: string, killer: string) => `${victim} mordio el polvo. ${killer} apretó el gatillo sin piedad.`,
-  (victim: string, killer: string) => `${killer} mando a ${victim} a la banca. Ni modo.`,
-  (victim: string, killer: string) => `${victim} se va con las manos vacias. ${killer} cobro la deuda.`,
-  (victim: string, killer: string) => `Se acabo la racha de ${victim}. ${killer} no tuvo clemencia.`,
-  (victim: string, killer: string) => `${victim} out. ${killer} sigue limpiando la mesa.`,
-  (victim: string, killer: string) => `${killer} sirvio la eliminacion de ${victim} fria y calculada.`,
-  (victim: string, killer: string) => `${victim} se fue al lobby. ${killer} dice que ni lo sintio.`,
-  (victim: string, killer: string) => `${victim} ya puede ir por una cerveza. ${killer} sigue en pie.`,
-  (victim: string, killer: string) => `${killer} no mostro compasion. ${victim} empaca y se va.`,
-  (victim: string, killer: string) => `Mano limpia de ${killer}. ${victim} no supo que lo golpeo.`,
-  (victim: string, killer: string) => `${victim} tenia sus fichas contadas. ${killer} se las conto el.`,
-  (victim: string, killer: string) => `${killer} cerro la mesa para ${victim}. Game over.`,
-]
-const POSITION_DIALOGUES: Record<number, (name: string) => string> = {
-  1: (n) => `${n} gana la noche. El rey de la mesa.`,
-  2: (n) => `${n} queda subcampeon. Tan cerca y tan lejos.`,
-  3: (n) => `${n} se lleva el tercer lugar. Podio asegurado.`,
-}
-const DEFAULT_POSITION = (n: string, pos: number) => `${n} termino en el lugar #${pos}.`
-
-function narrateEvent(
-  type: string,
-  playerName: string | undefined,
-  killerName: string | undefined,
-  position: number | null,
-): string {
-  if (type === 'position') {
-    const pos = position ?? 0
-    const fn = POSITION_DIALOGUES[pos]
-    return fn ? fn(playerName ?? '?') : DEFAULT_POSITION(playerName ?? '?', pos)
-  }
-  if (type === 'elimination') {
-    const fn = ELIM_DIALOGUES[Math.floor(Math.random() * ELIM_DIALOGUES.length)]
-    return fn(playerName ?? '?', killerName ?? '?')
-  }
-  return ''
 }
 
 function calcPot(cfg: GameConfig, attendees: Attendee[], evts: GameEvent[]): number {
@@ -141,16 +101,17 @@ export default function GamePage({ params }: Props) {
   const [events, setEvents] = useState<GameEvent[]>([])
   const [activePlayers, setActivePlayers] = useState<Attendee[]>([])
   const [showRebuyModal, setShowRebuyModal] = useState(false)
+  const [showDiscardModal, setShowDiscardModal] = useState(false)
+  const [showSummaryModal, setShowSummaryModal] = useState(false)
+  const [showEditOrderModal, setShowEditOrderModal] = useState(false)
+  const [orderDraft, setOrderDraft] = useState<GameEvent[]>([])
   const [headerHeight, setHeaderHeight] = useState(260)
   const [gameStartedAt, setGameStartedAt] = useState<string | null>(null)
   const [elapsed, setElapsed] = useState('00:00')
   const headerRef = useRef<HTMLDivElement>(null)
-  const narrateCache = useRef<Record<string, string>>({})
   const [selectedElim, setSelectedElim] = useState<Attendee | null>(null)
   const [selectedKiller, setSelectedKiller] = useState<Attendee | null>(null)
-  const [doRebuy, setDoRebuy] = useState(false)
   const [selectedRebuyPlayer, setSelectedRebuyPlayer] = useState<Attendee | null>(null)
-  const [rebuyTab, setRebuyTab] = useState<'rebuy' | 'addon'>('rebuy')
   const [paymentQueue, setPaymentQueue] = useState<Array<{ name: string; kills: number; amount: number; prizeAmount?: number }>>([])
   const [pendingFinish, setPendingFinish] = useState<{ winner: Attendee; allAtt: Attendee[]; allEvts: GameEvent[] } | null>(null)
   const [saving, setSaving] = useState(false)
@@ -256,8 +217,8 @@ export default function GamePage({ params }: Props) {
 
   const currentBlind = config.blind_levels?.[blindLevel]
   const maxRebuys = config.max_rebuys_per_player ?? 2
-  const rebuyCloseLevel = config.rebuy_close_level ?? 3
-  const canRebuyByLevel = blindLevel < rebuyCloseLevel
+  // null/0 = sin cierre: las recompras nunca se cierran por nivel
+  const rebuyCloseLevel = config.rebuy_close_level ?? null
 
   const addonEnabled = config.addon_enabled ?? false
   const addonLevel = config.addon_level ?? 999
@@ -268,10 +229,6 @@ export default function GamePage({ params }: Props) {
       (e.type === 'rebuy' || e.type === 'addon') &&
       (att.is_guest ? e.guest_name === att.guest_name : e.player_id === att.id)
     ).length
-  }
-
-  function canPlayerRebuy(att: Attendee) {
-    return canRebuyByLevel && getPlayerRebuys(att) < maxRebuys
   }
 
   function canPlayerAddon(att: Attendee) {
@@ -285,27 +242,23 @@ export default function GamePage({ params }: Props) {
     const position = activePlayers.length
     const pid = selectedElim.is_guest ? null : selectedElim.id
     const killerPid = selectedKiller?.is_guest ? null : (selectedKiller?.id ?? null)
-    const didRebuy = doRebuy
     const elimGuestName = selectedElim.is_guest ? selectedElim.name : null
     const killerGuestName = selectedKiller?.is_guest ? selectedKiller.name : null
 
-    await registerElimination(game_id, pid, killerPid, position, didRebuy, elimGuestName, killerGuestName)
+    await registerElimination(game_id, pid, killerPid, position, false, elimGuestName, killerGuestName)
 
     // Calcular remaining localmente
-    const remaining = didRebuy
-      ? activePlayers
-      : activePlayers.filter((p) => p.id !== selectedElim.id)
+    const remaining = activePlayers.filter((p) => p.id !== selectedElim.id)
 
     setSelectedElim(null)
     setSelectedKiller(null)
-    setDoRebuy(false)
 
     // Actualizar eventos desde BD
     const { events: newEvts } = await getGameState(game_id)
     setEvents(newEvts as GameEvent[])
 
-    // Si la eliminación es permanente, calcular pago de kills + premio de posición
-    if (!didRebuy) {
+    // Calcular pago de kills + premio de posición
+    {
       const killAmount = config.kill_amount ?? 0
       const evts = newEvts as GameEvent[]
 
@@ -467,15 +420,174 @@ export default function GamePage({ params }: Props) {
     )
   }
 
+  // Devuelve el evento rebuy que "revive" a esta eliminacion, si existe.
+  // Empareja en orden cronologico: cada eliminacion consume el primer rebuy
+  // libre que ocurre despues de ella. Una eliminacion sin rebuy emparejado
+  // es una muerte final.
+  function getRebuyForElim(e: GameEvent): GameEvent | null {
+    const key = e.player_id ?? e.guest_name ?? ''
+    const sameKey = (x: GameEvent) => (x.player_id ?? x.guest_name ?? '') === key
+    const mine = events
+      .filter((x) => sameKey(x) && (x.type === 'elimination' || x.type === 'rebuy'))
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+
+    const pendientes: GameEvent[] = []
+    const pares = new Map<string, GameEvent>()
+    for (const ev of mine) {
+      if (ev.type === 'elimination') pendientes.push(ev)
+      else {
+        const elim = pendientes.shift()
+        if (elim) pares.set(elim.id, ev)
+      }
+    }
+    return pares.get(e.id) ?? null
+  }
+
+  // El check se muestra segun cupo de recompras, ignorando el nivel de ciegas:
+  // corregir un registro pasado no es otorgar una recompra nueva.
+  function canToggleRebuy(e: GameEvent): boolean {
+    const att = attendees.find((a) =>
+      e.guest_name ? a.guest_name === e.guest_name : a.id === e.player_id
+    )
+    if (!att) return false
+    if (getRebuyForElim(e)) return true
+    return getPlayerRebuys(att) < maxRebuys
+  }
+
+  async function handleToggleElimRebuy(e: GameEvent) {
+    setSaving(true)
+    try {
+      if (getRebuyForElim(e)) {
+        // Al quitar la recompra el jugador vuelve a estar eliminado:
+        // recuperar la posicion que le toca segun cuantos siguen vivos.
+        await removeRebuyFromElimination(e.id, activePlayers.length)
+      } else {
+        await addRebuyToElimination(e.id)
+      }
+      await load()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function handleDiscardGame() {
+    setSaving(true)
+    try {
+      await discardGame(game_id)
+      router.push(`/${group_id}/admin`)
+    } catch {
+      setSaving(false)
+      setShowDiscardModal(false)
+    }
+  }
+
+  // Resumen en vivo de la jugada actual: posicion provisional, kills y puntos.
+  // Misma formula que handleFinishGame, pero sin cerrar la jugada.
+  function buildLiveSummary() {
+    const elimEvts = events.filter((e) => e.type === 'elimination')
+    const rebuyEvts = events.filter((e) => e.type === 'rebuy')
+
+    // Posicion definitiva solo de quienes no revivieron
+    const positionMap: Record<string, number> = {}
+    const processed: string[] = []
+    for (const e of elimEvts) {
+      const key = e.player_id ?? e.guest_name ?? ''
+      const rebuysDespues = rebuyEvts.filter((r) => {
+        const rKey = r.player_id ?? r.guest_name ?? ''
+        return rKey === key && r.created_at > e.created_at
+      }).length
+      const elimAnteriores = processed.filter((x) => x === key).length
+      if (rebuysDespues <= elimAnteriores) positionMap[key] = e.position ?? 0
+      processed.push(key)
+    }
+
+    const countGuests = config.points_count_guests ?? false
+    const totalPlayers = countGuests ? attendees.length : attendees.filter((a) => !a.is_guest).length
+    const scale = config.points_position_scale ?? []
+    const increment = config.points_position_increment ?? 1
+    const pkill = config.points_per_kill ?? 1
+    const patt = config.points_per_attendance ?? 1
+    const prebuy = config.points_per_rebuy ?? -1
+
+    const killsMap: Record<string, number> = {}
+    for (const e of elimEvts) {
+      const key = e.eliminated_by_player_id ?? e.eliminated_by_guest_name ?? ''
+      if (key) killsMap[key] = (killsMap[key] ?? 0) + 1
+    }
+    const rebuysMap: Record<string, number> = {}
+    for (const e of rebuyEvts) {
+      const key = e.player_id ?? e.guest_name ?? ''
+      if (key) rebuysMap[key] = (rebuysMap[key] ?? 0) + 1
+    }
+
+    const sigueVivo = (att: Attendee) => activePlayers.some((p) => p.id === att.id)
+
+    return attendees
+      .map((att) => {
+        const vivo = sigueVivo(att)
+        // Los que siguen jugando aun no tienen posicion: se estima la mejor posible
+        const pos = vivo ? activePlayers.length : (positionMap[att.id] ?? totalPlayers)
+        const kills = killsMap[att.id] ?? 0
+        const rebuys = rebuysMap[att.id] ?? 0
+        const ptPos = calcPositionPoints(pos, totalPlayers, scale, increment)
+        const ptKills = kills * pkill
+        const ptAtt = (!att.is_guest || countGuests) ? patt : 0
+        const ptRebuy = rebuys * prebuy
+        return {
+          id: att.id,
+          name: att.name,
+          vivo,
+          position: pos,
+          kills,
+          rebuys,
+          total: ptPos + ptKills + ptAtt + ptRebuy,
+        }
+      })
+      .sort((a, b) => {
+        if (a.vivo !== b.vivo) return a.vivo ? -1 : 1
+        return a.vivo ? b.total - a.total : a.position - b.position
+      })
+  }
+
+  // Abre el editor con las salidas definitivas (las revividas no tienen posicion)
+  function openEditOrder() {
+    const salidas = events
+      .filter((e) => e.type === 'elimination' && e.position != null && !getRebuyForElim(e))
+      .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+    setOrderDraft(salidas)
+    setShowEditOrderModal(true)
+  }
+
+  function moveInDraft(idx: number, dir: -1 | 1) {
+    const target = idx + dir
+    if (target < 0 || target >= orderDraft.length) return
+    const next = [...orderDraft]
+    ;[next[idx], next[target]] = [next[target], next[idx]]
+    setOrderDraft(next)
+  }
+
+  async function handleSaveOrder() {
+    setSaving(true)
+    try {
+      // Las posiciones disponibles son las mismas, reasignadas segun el nuevo orden
+      const posiciones = orderDraft
+        .map((e) => e.position ?? 0)
+        .sort((a, b) => a - b)
+      await reorderEliminations(
+        orderDraft.map((e, i) => ({ eventId: e.id, position: posiciones[i] }))
+      )
+      setShowEditOrderModal(false)
+      await load()
+    } finally {
+      setSaving(false)
+    }
+  }
+
   async function handleVoluntaryRebuy() {
     if (!selectedRebuyPlayer) return
     setSaving(true)
     const pid = selectedRebuyPlayer.is_guest ? null : selectedRebuyPlayer.id
-    if (rebuyTab === 'addon') {
-      await registerAddon(game_id, pid)
-    } else {
-      await registerRebuy(game_id, pid, selectedRebuyPlayer.is_guest, selectedRebuyPlayer.guest_name)
-    }
+    await registerAddon(game_id, pid)
     setShowRebuyModal(false)
     setSelectedRebuyPlayer(null)
     await load()
@@ -536,11 +648,11 @@ export default function GamePage({ params }: Props) {
           <h1 className="text-xl font-semibold tracking-tight">{gameName}</h1>
           <div className="w-16 flex justify-end">
             <button
-              onClick={() => setShowRebuyModal(true)}
-              className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] active:opacity-60 transition-opacity"
-              aria-label="Recompra"
+              onClick={() => setShowDiscardModal(true)}
+              className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] text-danger active:opacity-60 transition-opacity"
+              aria-label="Descartar jugada"
             >
-              <CircleDollar width={18} />
+              <TrashBin width={18} />
             </button>
           </div>
         </div>
@@ -562,7 +674,7 @@ export default function GamePage({ params }: Props) {
         for (let i = 0; i < levels.length; i++) {
           slots.push({ type: 'blind', idx: i })
           // Insertar "Sin recompras" justo después del último nivel con recompras
-          if (i === rebuyCloseLevel - 1 && rebuyCloseLevel < levels.length) {
+          if (rebuyCloseLevel && i === rebuyCloseLevel - 1 && rebuyCloseLevel < levels.length) {
             slots.push({ type: 'no_rebuy' })
           }
           // Insertar "Add-on" después del nivel configurado
@@ -688,41 +800,261 @@ export default function GamePage({ params }: Props) {
       </div>{/* fin zona fija */}
     </div>{/* fin fixed */}
 
-    {/* Zona scrolleable: solo el narrador */}
-    <div className="max-w-md mx-auto px-4 pb-[130px]" style={{ paddingTop: headerHeight }}>
-      <p className="text-sm font-semibold text-white mb-2 text-center">Actividad</p>
-      <div className="flex flex-col">
-        {(() => {
-          const filtered = events.filter((e) => e.type === 'elimination' || e.type === 'position')
-          if (filtered.length === 0) return (
-            <p className="text-sm text-muted text-center py-8">La partida acaba de comenzar...</p>
-          )
-          return [...filtered].reverse().map((e) => {
-            const playerName = e.guest_name
-              ?? attendees.find((a) => a.id === e.player_id)?.name
-            const killerName = e.eliminated_by_guest_name
-              ?? (e.eliminated_by_player_id ? attendees.find((a) => a.id === e.eliminated_by_player_id)?.name : undefined)
-            if (!narrateCache.current[e.id]) {
-              const text = narrateEvent(e.type, playerName, killerName, e.position)
-              if (text) narrateCache.current[e.id] = text
-            }
-            const text = narrateCache.current[e.id]
-            if (!text) return null
-            return (
-              <div key={e.id} className="flex flex-col gap-2 py-4">
-                <div className="flex items-center gap-3">
-                  <span className="text-xs text-muted shrink-0">
-                    {new Date(e.created_at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}
-                  </span>
-                  <Separator className="flex-1" />
-                </div>
-                <p className="text-sm leading-relaxed">{text}</p>
-              </div>
-            )
-          })
-        })()}
+    {/* Zona scrolleable: tabla de actividad */}
+    <div className="max-w-md mx-auto px-4 pb-[130px]" style={{ paddingTop: headerHeight - 12 }}>
+      {/* Acciones de la jugada: add-on · editar orden · resumen */}
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex gap-1.5">
+          {addonEnabled && (
+            <button
+              onClick={() => setShowRebuyModal(true)}
+              className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] active:opacity-60 transition-opacity"
+              aria-label="Add-on"
+            >
+              <CircleDollar width={18} />
+            </button>
+          )}
+          <button
+            onClick={openEditOrder}
+            className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] active:opacity-60 transition-opacity"
+            aria-label="Editar orden de salidas"
+          >
+            <Pencil width={18} />
+          </button>
+        </div>
+        <div className="flex gap-1.5">
+          <button
+            onClick={() => setShowSummaryModal(true)}
+            className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] active:opacity-60 transition-opacity"
+            aria-label="Resumen de la jugada"
+          >
+            <ChartColumn width={18} />
+          </button>
+        </div>
       </div>
+      {(() => {
+        const filtered = events.filter((e) => e.type === 'elimination')
+        if (filtered.length === 0) return (
+          <p className="text-sm text-muted text-center py-8">La partida acaba de comenzar...</p>
+        )
+        return (
+          <Card className="overflow-hidden p-0">
+            <Table>
+              <Table.ScrollContainer>
+                <Table.Content aria-label="Actividad de la partida">
+                  <Table.Header>
+                    <Table.Column isRowHeader>Jugador</Table.Column>
+                    <Table.Column>Sale por</Table.Column>
+                    <Table.Column className="text-center">Recompra</Table.Column>
+                  </Table.Header>
+                  <Table.Body>
+                    {[...filtered].reverse().map((e) => {
+                      const playerName = e.guest_name
+                        ?? attendees.find((a) => a.id === e.player_id)?.name
+                        ?? '?'
+                      const killerName = e.eliminated_by_guest_name
+                        ?? (e.eliminated_by_player_id
+                          ? attendees.find((a) => a.id === e.eliminated_by_player_id)?.name
+                          : undefined)
+                      const hasRebuy = !!getRebuyForElim(e)
+                      const canToggle = canToggleRebuy(e)
+                      return (
+                        <Table.Row key={e.id}>
+                          <Table.Cell>
+                            <div className="flex flex-col">
+                              <span className="text-sm font-medium leading-tight">{playerName}</span>
+                              <span className="text-xs text-muted">
+                                {new Date(e.created_at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            </div>
+                          </Table.Cell>
+                          <Table.Cell>
+                            <span className="text-sm">{killerName ?? '—'}</span>
+                          </Table.Cell>
+                          <Table.Cell>
+                            <div className="flex justify-center">
+                            {canToggle ? (
+                              <Checkbox
+                                isSelected={hasRebuy}
+                                isDisabled={saving}
+                                onChange={() => handleToggleElimRebuy(e)}
+                                aria-label={`Recompra de ${playerName}`}
+                              >
+                                <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                              </Checkbox>
+                            ) : (
+                              <span className="text-xs text-muted">—</span>
+                            )}
+                            </div>
+                          </Table.Cell>
+                        </Table.Row>
+                      )
+                    })}
+                  </Table.Body>
+                </Table.Content>
+              </Table.ScrollContainer>
+            </Table>
+          </Card>
+        )
+      })()}
     </div>
+
+    {/* Modal: Resumen de la jugada en curso */}
+    <Modal.Backdrop isOpen={showSummaryModal} onOpenChange={setShowSummaryModal}>
+      <Modal.Container>
+        <Modal.Dialog className="max-h-[85vh] flex flex-col">
+          <Modal.Header>
+            <Modal.Heading>Resumen de la jugada</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body className="overflow-y-auto">
+            {(() => {
+              const filas = buildLiveSummary()
+              if (filas.length === 0) return <p className="text-sm text-muted py-2">Sin datos todavía.</p>
+              return (
+                <Card className="overflow-hidden p-0">
+                  <Table>
+                    <Table.ScrollContainer>
+                      <Table.Content aria-label="Resumen de la jugada">
+                        <Table.Header>
+                          <Table.Column isRowHeader>Jugador</Table.Column>
+                          <Table.Column className="text-center">Pos</Table.Column>
+                          <Table.Column className="text-center">Kills</Table.Column>
+                          <Table.Column className="text-right">Pts</Table.Column>
+                        </Table.Header>
+                        <Table.Body>
+                          {filas.map((r) => (
+                            <Table.Row key={r.id}>
+                              <Table.Cell>
+                                <div className="flex flex-col">
+                                  <span className="text-sm font-medium leading-tight">{r.name}</span>
+                                  <span className={`text-xs ${r.vivo ? 'text-accent' : 'text-muted'}`}>
+                                    {r.vivo ? 'Jugando' : 'Eliminado'}
+                                    {r.rebuys > 0 ? ` · ${r.rebuys} rec.` : ''}
+                                  </span>
+                                </div>
+                              </Table.Cell>
+                              <Table.Cell className="text-center font-mono text-sm">
+                                {r.vivo ? '—' : r.position}
+                              </Table.Cell>
+                              <Table.Cell className="text-center font-mono text-sm">{r.kills}</Table.Cell>
+                              <Table.Cell className="text-right font-semibold">{r.total}</Table.Cell>
+                            </Table.Row>
+                          ))}
+                        </Table.Body>
+                      </Table.Content>
+                    </Table.ScrollContainer>
+                  </Table>
+                </Card>
+              )
+            })()}
+            <p className="text-xs text-muted mt-3">
+              Los jugadores en mesa aún no tienen posición definitiva: sus puntos son provisionales.
+            </p>
+          </Modal.Body>
+          <Modal.Footer>
+            <Button onPress={() => setShowSummaryModal(false)} className="flex-1">Cerrar</Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+
+    {/* Modal: Editar orden de salidas */}
+    <Modal.Backdrop isOpen={showEditOrderModal} onOpenChange={setShowEditOrderModal}>
+      <Modal.Container>
+        <Modal.Dialog className="max-h-[85vh] flex flex-col">
+          <Modal.Header>
+            <Modal.Heading>Editar orden de salidas</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body className="overflow-y-auto">
+            {orderDraft.length === 0 ? (
+              <p className="text-sm text-muted py-2">Todavía no hay salidas registradas.</p>
+            ) : (
+              <>
+                <p className="text-xs text-muted mb-3">
+                  El primero de la lista es quien salió antes (peor posición).
+                </p>
+                <div className="flex flex-col gap-2">
+                  {orderDraft.map((e, i) => {
+                    const nombre = e.guest_name
+                      ?? attendees.find((a) => a.id === e.player_id)?.name
+                      ?? '?'
+                    const posiciones = orderDraft.map((x) => x.position ?? 0).sort((a, b) => a - b)
+                    return (
+                      <div key={e.id} className="flex items-center gap-2">
+                        <span className="text-sm font-mono text-muted w-7 shrink-0">#{posiciones[i]}</span>
+                        <span className="text-sm flex-1 truncate">{nombre}</span>
+                        <button
+                          onClick={() => moveInDraft(i, -1)}
+                          disabled={i === 0}
+                          className="w-8 h-8 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] disabled:opacity-30 active:opacity-60"
+                          aria-label={`Subir a ${nombre}`}
+                        >
+                          <ArrowUp width={16} />
+                        </button>
+                        <button
+                          onClick={() => moveInDraft(i, 1)}
+                          disabled={i === orderDraft.length - 1}
+                          className="w-8 h-8 rounded-full flex items-center justify-center bg-[var(--surface-secondary)] disabled:opacity-30 active:opacity-60"
+                          aria-label={`Bajar a ${nombre}`}
+                        >
+                          <ArrowDown width={16} />
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              </>
+            )}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="ghost" onPress={() => setShowEditOrderModal(false)} isDisabled={saving}>
+              Cancelar
+            </Button>
+            <Button
+              onPress={handleSaveOrder}
+              isDisabled={saving || orderDraft.length === 0}
+              isPending={saving}
+              className="flex-1"
+            >
+              Guardar orden
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
+
+    {/* Modal: Confirmar descarte de la jugada */}
+    <Modal.Backdrop isOpen={showDiscardModal} onOpenChange={setShowDiscardModal}>
+      <Modal.Container>
+        <Modal.Dialog>
+          <Modal.Header>
+            <Modal.Heading>¿Descartar esta jugada?</Modal.Heading>
+          </Modal.Header>
+          <Modal.Body>
+            <p className="text-sm text-muted">
+              La jugada <span className="font-medium text-white">{gameName}</span> se invalida:
+              no suma puntos ni aparece en el historial, y se borran las eliminaciones y
+              recompras registradas. Podrás iniciar una jugada nueva.
+            </p>
+            <p className="text-sm text-danger mt-2">Esta acción no se puede deshacer.</p>
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="ghost" onPress={() => setShowDiscardModal(false)} isDisabled={saving}>
+              Cancelar
+            </Button>
+            <Button
+              variant="danger"
+              onPress={handleDiscardGame}
+              isDisabled={saving}
+              isPending={saving}
+              className="flex-1"
+            >
+              Sí, descartar
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
 
     {/* Modal: Cola de pagos pendientes */}
     <Modal.Backdrop isOpen={paymentQueue.length > 0} onOpenChange={() => {}}>
@@ -765,36 +1097,20 @@ export default function GamePage({ params }: Props) {
     {/* Drawer: Recompra / Add-on */}
     <Drawer.Backdrop
       isOpen={showRebuyModal}
-      onOpenChange={(open) => { setShowRebuyModal(open); if (!open) { setSelectedRebuyPlayer(null); setRebuyTab('rebuy') } }}
+      onOpenChange={(open) => { setShowRebuyModal(open); if (!open) setSelectedRebuyPlayer(null) }}
       variant="blur"
     >
       <Drawer.Content placement="bottom">
         <Drawer.Dialog className="max-h-[80vh] flex flex-col">
           <Drawer.Handle />
           <Drawer.Header>
-            <Drawer.Heading>Recompra / Add-on</Drawer.Heading>
+            <Drawer.Heading>Add-on</Drawer.Heading>
           </Drawer.Header>
           <Drawer.Body className="overflow-y-auto">
-            <Tabs
-              selectedKey={rebuyTab}
-              onSelectionChange={(k) => { setRebuyTab(k as 'rebuy' | 'addon'); setSelectedRebuyPlayer(null) }}
-              className="w-full mb-3"
-            >
-              <Tabs.ListContainer>
-                <Tabs.List aria-label="Tipo">
-                  <Tabs.Tab id="rebuy">Recompra<Tabs.Indicator /></Tabs.Tab>
-                  <Tabs.Tab id="addon" isDisabled={!addonEnabled}>Add-on<Tabs.Indicator /></Tabs.Tab>
-                </Tabs.List>
-              </Tabs.ListContainer>
-            </Tabs>
             {(() => {
-              const list = rebuyTab === 'rebuy'
-                ? attendees.filter((p) => canPlayerRebuy(p))
-                : attendees.filter((p) => canPlayerAddon(p))
+              const list = attendees.filter((p) => canPlayerAddon(p))
               if (list.length === 0) return (
-                <p className="text-sm text-muted py-2">
-                  {rebuyTab === 'rebuy' ? 'Ningún jugador puede recomprar ahora.' : 'Ningún jugador puede hacer add-on ahora.'}
-                </p>
+                <p className="text-sm text-muted py-2">Ningún jugador puede hacer add-on ahora.</p>
               )
               return (
                 <div className="grid grid-cols-2 gap-2">
@@ -819,7 +1135,7 @@ export default function GamePage({ params }: Props) {
           <Drawer.Footer>
             <Button
               variant="ghost"
-              onPress={() => { setShowRebuyModal(false); setSelectedRebuyPlayer(null); setRebuyTab('rebuy') }}
+              onPress={() => { setShowRebuyModal(false); setSelectedRebuyPlayer(null) }}
             >
               Cancelar
             </Button>
@@ -829,7 +1145,7 @@ export default function GamePage({ params }: Props) {
               isPending={saving}
               className="flex-1"
             >
-              {rebuyTab === 'rebuy' ? 'Confirmar recompra' : 'Confirmar add-on'}
+              Confirmar add-on
             </Button>
           </Drawer.Footer>
         </Drawer.Dialog>
@@ -849,7 +1165,6 @@ export default function GamePage({ params }: Props) {
               const p = activePlayers.find((p) => p.id === String(key)) ?? null
               setSelectedElim(p)
               setSelectedKiller(null)
-              setDoRebuy(false)
             }}
           >
             <Select.Trigger>
@@ -895,15 +1210,6 @@ export default function GamePage({ params }: Props) {
             </Select.Popover>
           </Select>
         </div>
-
-        {selectedElim && canPlayerRebuy(selectedElim) && (
-          <Label className="flex items-center gap-2 cursor-pointer">
-            <Checkbox isSelected={doRebuy} onChange={(v) => setDoRebuy(v)} aria-label="Recompra">
-              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
-            </Checkbox>
-            <span className="text-sm">Se recompra ({getPlayerRebuys(selectedElim)}/{maxRebuys})</span>
-          </Label>
-        )}
 
         <Button
           onPress={handleEliminate}

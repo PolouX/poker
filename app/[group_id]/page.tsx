@@ -4,6 +4,7 @@ import { useEffect, useState, use } from 'react'
 import { Card, Chip, Drawer, Modal, Separator, Spinner, Table } from '@heroui/react'
 import { SealCheck, Skull, ShieldKeyhole, Flame, Medal } from '@gravity-ui/icons'
 import { supabase } from '@/lib/supabase'
+import { effectiveDiscard } from '@/lib/scoring'
 
 interface Player {
   id: string
@@ -473,13 +474,15 @@ function PlayerProfilePanel({ groupId, playerId }: { groupId: string; playerId: 
         return
       }
 
-      const discard = (seasonData.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+      const discardCfg = (seasonData.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
 
       const { count: totalGames } = await supabase
         .from('games').select('*', { count: 'exact', head: true })
         .eq('season_id', seasonData.id).eq('status', 'finished')
 
       const tg = totalGames ?? 0
+      // Solo se descarta cuando hay mas jugadas que descartes
+      const discard = effectiveDiscard(discardCfg, tg)
 
       // Funcion para aplicar descarte a un array de puntos por jugada
       function discardWorst(scores: number[], gamesAttended: number): number {
@@ -690,7 +693,7 @@ export default function SeasonPage({ params }: Props) {
 
       setSeason(seasonData as Season)
 
-      const discard = (seasonData.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
+      const discardCfg = (seasonData.config as { worst_results_to_discard?: number } | null)?.worst_results_to_discard ?? 0
 
       const { data: resultsData } = await supabase
         .from('game_results')
@@ -704,6 +707,8 @@ export default function SeasonPage({ params }: Props) {
         .from('games').select('id, name').eq('season_id', seasonData.id).eq('status', 'finished').order('created_at', { ascending: false })
 
       const totalFinishedGames = gamesData?.length ?? 0
+      // Solo se descarta cuando hay mas jugadas que descartes
+      const discard = effectiveDiscard(discardCfg, totalFinishedGames)
 
       // Recopilar puntos por jugada para cada jugador
       const pointsByPlayer: Record<string, number[]> = {}

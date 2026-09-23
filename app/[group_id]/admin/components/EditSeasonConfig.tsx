@@ -1,20 +1,23 @@
 'use client'
 
-import { useState } from 'react'
-import { Button, Card, Input, Label, Separator, Switch } from '@heroui/react'
+import { useState, useEffect, useRef } from 'react'
+import { Button, Card, Checkbox, Input, Label, Separator, Switch } from '@heroui/react'
 
-import { TrashBin } from '@gravity-ui/icons'
-import { updateSeasonConfig, type SeasonConfig } from '@/app/actions/seasons'
+import { TrashBin, Pencil } from '@gravity-ui/icons'
+import { updateSeasonConfig, getGroupPlayers, getSeasonPlayers, addPlayer, updatePlayerName, updateSeasonPlayers, type SeasonConfig } from '@/app/actions/seasons'
+
+interface Player { id: string; name: string }
 
 interface Props {
+  groupId: string
   season: { id: string; name: string; config: Record<string, unknown> }
   onDone: () => void
   onCancel: () => void
 }
 
-const STEPS = ['Puntos', 'Montos', 'Ciegas']
+const STEPS = ['Puntos', 'Montos', 'Ciegas', 'Jugadores']
 
-export default function EditSeasonConfig({ season, onDone, onCancel }: Props) {
+export default function EditSeasonConfig({ groupId, season, onDone, onCancel }: Props) {
   const [step, setStep] = useState(0)
   const [config, setConfig] = useState<SeasonConfig>({
     points_per_kill: 1,
@@ -48,20 +51,90 @@ export default function EditSeasonConfig({ season, onDone, onCancel }: Props) {
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [players, setPlayers] = useState<Player[]>([])
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [newPlayerName, setNewPlayerName] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const editInputRef = useRef<HTMLInputElement>(null)
   const [activeBlindIdx, setActiveBlindIdx] = useState(0)
   const [anteEnabled, setAnteEnabled] = useState(
     (season.config as Partial<SeasonConfig>)?.blind_levels?.some((l) => l.ante != null && l.ante > 0) ?? false
   )
 
+  useEffect(() => {
+    getGroupPlayers(groupId).then(setPlayers)
+    getSeasonPlayers(season.id).then((rows) => {
+      setSelected(new Set(rows.map((r) => r.player_id as string)))
+    })
+  }, [groupId, season.id])
+
+  useEffect(() => {
+    if (editingId && editInputRef.current) editInputRef.current.focus()
+  }, [editingId])
+
+  function togglePlayer(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  async function handleAddPlayer() {
+    if (!newPlayerName.trim()) return
+    const p = await addPlayer(groupId, newPlayerName.trim())
+    setPlayers((prev) => [...prev, p])
+    setSelected((prev) => new Set([...prev, p.id]))
+    setNewPlayerName('')
+  }
+
+  async function handleSaveEdit(id: string) {
+    if (!editingName.trim()) { setEditingId(null); return }
+    try {
+      await updatePlayerName(id, editingName.trim())
+      setPlayers((prev) => prev.map((p) => p.id === id ? { ...p, name: editingName.trim() } : p))
+    } finally {
+      setEditingId(null)
+    }
+  }
+
   function setNum(field: keyof SeasonConfig, val: string) {
     setConfig((c) => ({ ...c, [field]: Number(val) }))
+  }
+
+  // Campos donde dejar el input en blanco significa "sin limite" (null)
+  function setNumOrNull(field: keyof SeasonConfig, val: string) {
+    const trimmed = val.trim()
+    setConfig((c) => ({ ...c, [field]: trimmed === '' ? null : Number(trimmed) }))
   }
 
   async function handleSave() {
     setSaving(true)
     setError('')
     try {
+      if (selected.size === 0) {
+        setError('La temporada debe tener al menos un jugador.')
+        setSaving(false)
+        return
+      }
       await updateSeasonConfig(season.id, config)
+      const { blockedNames } = await updateSeasonPlayers(season.id, [...selected])
+      if (blockedNames.length > 0) {
+        // No se pudo quitar a quienes ya jugaron: se avisa y se mantiene abierto
+        setNotice(
+          `No se pudo quitar a ${blockedNames.join(', ')}: ya tienen resultados en esta temporada.`
+        )
+        setSelected((prev) => {
+          const next = new Set(prev)
+          players.filter((p) => blockedNames.includes(p.name)).forEach((p) => next.add(p.id))
+          return next
+        })
+        setSaving(false)
+        return
+      }
       onDone()
     } catch {
       setError('Error al guardar la configuración.')
@@ -369,7 +442,14 @@ export default function EditSeasonConfig({ season, onDone, onCancel }: Props) {
             <div className="grid grid-cols-2 gap-3">
               <div className="flex flex-col gap-1">
                 <Label htmlFor="rebuy_close_level">Cierre recompras (nivel)</Label>
-                <Input id="rebuy_close_level" inputMode="numeric" value={String(config.rebuy_close_level)} onChange={(e) => setNum('rebuy_close_level', e.target.value)} />
+                <Input
+                  id="rebuy_close_level"
+                  inputMode="numeric"
+                  placeholder="Sin cierre"
+                  value={config.rebuy_close_level == null ? '' : String(config.rebuy_close_level)}
+                  onChange={(e) => setNumOrNull('rebuy_close_level', e.target.value)}
+                />
+                <span className="text-xs text-muted">Vacío: se puede recomprar siempre</span>
               </div>
               <div className="flex flex-col gap-1">
                 <Label htmlFor="addon_level">Nivel de add-on</Label>
@@ -377,6 +457,70 @@ export default function EditSeasonConfig({ season, onDone, onCancel }: Props) {
               </div>
             </div>
 
+            {error && <p className="text-sm text-danger">{error}</p>}
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="flex flex-col gap-3">
+            <p className="text-sm font-medium">Jugadores participantes</p>
+
+            <div className="flex gap-2">
+              <Input
+                className="flex-1"
+                placeholder="Nuevo jugador..."
+                value={newPlayerName}
+                onChange={(e) => setNewPlayerName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleAddPlayer() }}
+              />
+              <Button variant="secondary" onPress={handleAddPlayer}>Agregar</Button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              {players.map((p) => (
+                <Card
+                  key={p.id}
+                  className="cursor-pointer active:opacity-70 transition-opacity"
+                  onClick={() => { if (editingId !== p.id) togglePlayer(p.id) }}
+                >
+                  <Card.Content className="flex flex-row items-center gap-2 py-3 px-3">
+                    <Checkbox
+                      isSelected={selected.has(p.id)}
+                      onChange={() => togglePlayer(p.id)}
+                      aria-label={p.name}
+                    >
+                      <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                    </Checkbox>
+                    {editingId === p.id ? (
+                      <input
+                        ref={editInputRef}
+                        className="flex-1 bg-transparent text-sm font-medium outline-none border-b border-[var(--accent)] min-w-0"
+                        value={editingName}
+                        onChange={(e) => setEditingName(e.target.value)}
+                        onBlur={() => handleSaveEdit(p.id)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') handleSaveEdit(p.id) }}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    ) : (
+                      <span className="flex-1 text-sm font-medium leading-tight truncate">{p.name}</span>
+                    )}
+                    <button
+                      className="shrink-0 p-0.5"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setEditingId(p.id)
+                        setEditingName(p.name)
+                      }}
+                      aria-label="Editar nombre"
+                    >
+                      <Pencil className="size-3.5 text-[var(--accent)]" />
+                    </button>
+                  </Card.Content>
+                </Card>
+              ))}
+            </div>
+
+            {notice && <p className="text-sm text-warning">{notice}</p>}
             {error && <p className="text-sm text-danger">{error}</p>}
           </div>
         )}
@@ -388,12 +532,12 @@ export default function EditSeasonConfig({ season, onDone, onCancel }: Props) {
           {step === 0 ? 'Cancelar' : 'Atrás'}
         </Button>
         <Button
-          onPress={() => { if (step < 2) setStep(step + 1); else handleSave() }}
+          onPress={() => { if (step < 3) setStep(step + 1); else handleSave() }}
           isPending={saving}
           isDisabled={saving}
           className="flex-1"
         >
-          {step === 2 ? 'Guardar' : 'Siguiente'}
+          {step === 3 ? 'Guardar' : 'Siguiente'}
         </Button>
       </div>
     </div>
